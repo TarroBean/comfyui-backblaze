@@ -4,6 +4,7 @@ from PIL import Image
 import io
 import boto3
 import time
+import os
 
 class BackblazeUploader:
     @classmethod
@@ -17,7 +18,7 @@ class BackblazeUploader:
                 "bucket_name": ("STRING", {"default": ""}),
                 "file_name_prefix": ("STRING", {"default": "comfy_gen"}),
                 "extension": (["png", "jpg", "webp"], {"default": "png"}),
-                "add_timestamp": ("BOOLEAN", {"default": True}),
+                "naming_mode": (["strict", "timestamp", "sequential"], {"default": "sequential"}),
             },
         }
 
@@ -27,8 +28,7 @@ class BackblazeUploader:
     OUTPUT_NODE = True
     CATEGORY = "Cloud Storage"
 
-    def upload_images(self, images, endpoint_url, key_id, application_key, bucket_name, file_name_prefix, extension, add_timestamp):
-        # Исправление endpoint: добавляем https:// если его нет
+    def upload_images(self, images, endpoint_url, key_id, application_key, bucket_name, file_name_prefix, extension, naming_mode):
         if not endpoint_url.startswith('http'):
             endpoint_url = f'https://{endpoint_url}'
 
@@ -41,22 +41,42 @@ class BackblazeUploader:
         
         uploaded_urls = []
         timestamp = time.strftime("%Y%m%d-%H%M%S")
+        
+        # Логика определения начального индекса для режима sequential
+        next_idx = 1
+        if naming_mode == "sequential":
+            try:
+                response = s3.list_objects_v2(Bucket=bucket_name, Prefix=file_name_prefix)
+                next_idx = response.get('KeyCount', 0) + 1
+            except Exception as e:
+                print(f"!!! Backblaze List Error: {str(e)}")
+                # Если не удалось получить список, начнем с 1 или выдадим ошибку
 
         for i, image in enumerate(images):
+            # Подготовка изображения
             i_image = 255. * image.cpu().numpy()
             img = Image.fromarray(np.uint8(i_image))
-            
             buffer = io.BytesIO()
             img.save(buffer, format=extension.upper())
             buffer.seek(0)
             
-            # Формируем имя: префикс + время (опционально) + индекс
+            # Сборка имени файла в зависимости от режима
             name_parts = [file_name_prefix]
-            if add_timestamp:
-                name_parts.append(timestamp)
-            if len(images) > 1:
-                name_parts.append(str(i))
             
+            if naming_mode == "timestamp":
+                name_parts.append(timestamp)
+                # Если в батче несколько фото, добавляем индекс внутри батча
+                if len(images) > 1:
+                    name_parts.append(str(i))
+                    
+            elif naming_mode == "sequential":
+                current_file_idx = next_idx + i
+                name_parts.append(f"{current_file_idx:04d}")
+            
+            # В режиме 'strict' используется только file_name_prefix (и индекс i, если фото > 1)
+            elif naming_mode == "strict" and len(images) > 1:
+                name_parts.append(str(i))
+
             full_filename = f"{'_'.join(name_parts)}.{extension}"
             
             try:
@@ -66,7 +86,6 @@ class BackblazeUploader:
                     full_filename,
                     ExtraArgs={'ContentType': f'image/{extension}'}
                 )
-                # Чистим URL от лишних слешей для корректного вывода
                 base_url = endpoint_url.rstrip('/')
                 url = f"{base_url}/{bucket_name}/{full_filename}"
                 uploaded_urls.append(url)
